@@ -11,6 +11,8 @@ Version **1.0.0** provides 79 focused MCP tools. It completes the guarded resour
 
 > This is an independent community project and is not affiliated with or endorsed by Adobe.
 
+> **Fork note.** This is a fork of [elliezu/SubstancePainterMCP](https://github.com/elliezu/SubstancePainterMCP) (MIT). Version 1.1.0 adds batching, previews, Painter 11.1 (Steam/Linux) compatibility, and fixes found while texturing game kits with it. See the [1.1.0 changelog](CHANGELOG.md#110---2026-10-05).
+
 ## Highlights
 
 - Inspect the open project, Texture Sets, channels, resources, export presets, and complete layer tree.
@@ -38,13 +40,16 @@ Version **1.0.0** provides 79 focused MCP tools. It completes the guarded resour
 - Plan and create projects from approved meshes with optional templates, mesh maps, Auto UV, USD/glTF settings, verified backup, and failure recovery.
 - Open approved projects safely and explicitly save the current project with post-write verification.
 - Detect runtime capabilities instead of trusting Painter's reported Python API version alone.
-- Keep arbitrary Python execution disabled unless the user explicitly opts in.
+- Run many tool calls in one request with `run_batch`, chaining results (`"$0.uid"`) between steps.
+- See results without exporting by hand: `preview_textures` returns low-res channel images inline, `capture_ui` screenshots the layer stack and panels.
+- Edit Generator/Filter parameters (dirt, edge wear…), Levels, Color Selection (ID-map) and Compare Mask effects, and blend mask effects together.
+- Keep arbitrary Python execution disabled unless the user explicitly opts in; when enabled it captures stdout and returns tracebacks instead of failing.
 
 ## Compatibility
 
 | Component | Supported / validated |
 |---|---|
-| Adobe Substance 3D Painter | Live-tested with 12.1.1 |
+| Adobe Substance 3D Painter | Live-tested with 12.1.1 (upstream) and 11.1.3 Steam edition on Linux (this fork) |
 | Painter Python API | Runtime reported 0.3.5 in the validated build |
 | Python | 3.10 or newer |
 | MCP Python SDK | `mcp>=1.28,<2` |
@@ -105,15 +110,17 @@ Painter builds may expose newer features while reporting an older API version st
 | `set_fill_projection` | Set Fill, UV, or Triplanar projection and transforms transactionally. |
 | `get_fill_sources` | Inspect material-mode or per-channel Fill sources. |
 | `set_fill_resource` | Assign a `resource://` asset to one channel or a complete Fill material. |
-| `set_fill_parameters` | Transactionally update typed procedural Substance parameters. |
+| `set_fill_parameters` | Transactionally update typed procedural parameters on Fill layers, mask Fills, Generators, and Filters. |
+| `get_effect_parameters` | Read Levels, Color Selection, or Compare Mask effect parameters. |
+| `set_effect_parameters` | Edit Levels, Color Selection (ID-map masking), or Compare Mask effects by field name. |
 | `set_procedural_input` | Connect a verified resource to a procedural image input or reset its default. |
 | `apply_fill_preset` | Apply a named preset exposed by the current procedural source. |
 | `set_fill_anchor_source` | Bind an Anchor Point to one Fill channel or the complete material. |
 | `set_fill_projection_advanced` | Configure UV, Triplanar, Planar, Spherical, or Cylindrical projection details. |
 | `set_active_channels` | Replace a Fill or Paint layer's active channel set. |
 | `set_layer_mask` | Add, replace, or remove a White/Black mask. |
-| `insert_mask_effect` | Insert procedural or paint effects into a layer's mask stack. |
-| `set_layer_properties` | Set visibility and channel-specific opacity or blend mode. |
+| `insert_mask_effect` | Insert Fill, Paint, Generator, Filter, Levels, Anchor, Smart Mask, Color Selection, or Compare Mask effects into a mask stack. |
+| `set_layer_properties` | Set visibility, opacity, or blend mode; per channel for layers, channel-less for mask effects. |
 | `rename_layer` | Rename a layer by UID. |
 | `select_layers` | Select one or more layers by UID. |
 | `delete_layer` | Delete a layer by UID. |
@@ -149,7 +156,10 @@ Layer names are not unique in Painter. All mutation tools therefore use the UIDs
 | `start_batch_bake` | Preflight and asynchronously bake multiple Texture Sets with restoration and a per-map result manifest. |
 | `plan_mesh_reload` | Validate an approved mesh path and preview backup/current Texture Set scope. |
 | `start_mesh_reload` | Optionally back up, then asynchronously reload a mesh after `confirm=true`. |
-| `execute_python` | Run arbitrary Painter Python only when explicitly enabled. |
+| `execute_python` | Run arbitrary Painter Python only when explicitly enabled; modules preloaded, `params` in, `result`/stdout/traceback out. |
+| `run_batch` | Run a list of tool calls in order in one request, with `$N.key` / `$prev.key` result references. |
+| `preview_textures` | Export low-res channel previews to a private cache and return them as images. |
+| `capture_ui` | Screenshot Painter's UI (layer stack, properties, status-bar errors); viewports are not captured. |
 
 ## Installation
 

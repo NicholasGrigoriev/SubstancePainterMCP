@@ -75,6 +75,129 @@ BLOCKED_RESOURCE_EXTENSIONS = {
 }
 
 
+_COLLISION_PREFIXES = re.compile(rb"\b(U(?:CX|BX|SP|CP)_[A-Za-z0-9_.]+)")
+
+
+def _collision_mesh_names(mesh: Path) -> list[str]:
+    """Unreal collision proxies (no UVs) make Painter refuse the whole scene."""
+    if mesh.suffix.casefold() not in {".fbx", ".obj"}:
+        return []
+    try:
+        data = mesh.read_bytes()
+    except OSError:
+        return []
+    return sorted({match.decode("ascii", "replace") for match in _COLLISION_PREFIXES.findall(data)})
+
+
+_GEOMETRY_HELPER = '''
+def udim(tile):
+    return 1001 + tile.u + 10 * tile.v
+
+def read_geometry_mask(node):
+    # Newer Painter exposes get_geometry_mask() params objects; 11.1 (API 0.3.5) only has a
+    # mask type plus enabled-mesh / enabled-UV-tile lists (always an inclusion list).
+    if hasattr(node, "get_geometry_mask"):
+        geometry = node.get_geometry_mask()
+        if isinstance(geometry, layerstack.GeometryMaskMeshParams):
+            return {"type": "Mesh", "inclusion_list": geometry.inclusion_list, "elements": list(geometry.meshes)}
+        if isinstance(geometry, layerstack.GeometryMaskUVTilesParams):
+            return {"type": "UVTile", "inclusion_list": geometry.inclusion_list,
+                    "elements": [udim(tile) for tile in geometry.uv_tiles]}
+        return {"type": type(geometry).__name__, "inclusion_list": None, "elements": []}
+    kind = node.get_geometry_mask_type().name
+    if kind == "Mesh":
+        return {"type": "Mesh", "inclusion_list": True, "elements": list(node.get_geometry_mask_enabled_meshes())}
+    if kind == "UVTile":
+        return {"type": "UVTile", "inclusion_list": True,
+                "elements": [udim(tile) for tile in node.get_geometry_mask_enabled_uv_tiles()]}
+    return {"type": kind, "inclusion_list": None, "elements": []}
+
+def write_geometry_mask(node, mask_type, inclusion_list, elements, available):
+    if hasattr(layerstack, "GeometryMaskMeshParams"):
+        if mask_type == "mesh":
+            settings = layerstack.GeometryMaskMeshParams(inclusion_list=inclusion_list, meshes=elements)
+        else:
+            settings = layerstack.GeometryMaskUVTilesParams(
+                inclusion_list=inclusion_list, uv_tiles=[available[item] for item in elements])
+        node.set_geometry_mask(settings)
+        return
+    if not inclusion_list:
+        elements = [item for item in available if item not in elements]
+    if mask_type == "mesh":
+        node.set_geometry_mask_type(layerstack.GeometryMaskType.Mesh)
+        node.set_geometry_mask_enabled_meshes(list(elements))
+    else:
+        node.set_geometry_mask_type(layerstack.GeometryMaskType.UVTile)
+        node.set_geometry_mask_enabled_uv_tiles([available[item] for item in elements])
+'''
+
+
+_CHANNEL_HELPER = '''
+def set_channels_keeping_sources(node, channels):
+    # Painter 11.1.3 resets every channel's source whenever active_channels is assigned (even to
+    # the same set), so snapshot the channels that stay active and restore them afterwards.
+    if not hasattr(type(node), "active_channels"):
+        raise TypeError(f"{type(node).__name__} has no active channels in this Painter version")
+    channels = set(channels)
+    current = set(node.active_channels)
+    if channels == current:
+        return
+    snapshots = {}
+    if getattr(getattr(node, "source_mode", None), "name", None) == "Split":
+        for channel in current & channels:
+            try:
+                source = node.get_source(channel)
+            except Exception:
+                continue
+            try:
+                resource_id = getattr(source, "resource_id", None)
+            except ValueError:
+                resource_id = None
+            if resource_id is not None:
+                snap = {"resource": resource_id, "parameters": {}, "inputs": {}}
+                if hasattr(source, "get_parameters"):
+                    try:
+                        snap["parameters"] = dict(source.get_parameters())
+                    except Exception:
+                        pass
+                for name in getattr(source, "image_inputs", []) or []:
+                    try:
+                        inner = source.get_source(name)
+                        inner_id = getattr(inner, "resource_id", None)
+                    except Exception:
+                        continue
+                    if inner_id is not None:
+                        snap["inputs"][name] = inner_id
+                snapshots[channel] = snap
+            elif hasattr(source, "get_color"):
+                snapshots[channel] = {"color": source.get_color()}
+            elif hasattr(source, "anchor"):
+                snapshots[channel] = {"anchor": source.anchor()}
+    node.active_channels = channels
+    for channel, snap in snapshots.items():
+        if "color" in snap:
+            node.set_source(channel, snap["color"])
+        elif "anchor" in snap:
+            node.set_source(channel, snap["anchor"])
+        else:
+            restored = node.set_source(channel, snap["resource"])
+            for name, inner_id in snap["inputs"].items():
+                try:
+                    restored.set_source(name, inner_id)
+                except Exception:
+                    pass
+            if snap["parameters"]:
+                try:
+                    restored.set_parameters(snap["parameters"])
+                except Exception:
+                    for key, value in snap["parameters"].items():
+                        try:
+                            restored.set_parameters({key: value})
+                        except Exception:
+                            pass
+'''
+
+
 def _unwrap(envelope: dict[str, Any]) -> Any:
     if envelope.get("success"):
         return envelope.get("data")
@@ -228,6 +351,16 @@ result = {
             errors.append({
                 "code": "backup_required",
                 "message": "Replacing an open project requires backup_current_path.",
+            })
+        collision = _collision_mesh_names(mesh)
+        if collision:
+            errors.append({
+                "code": "collision_meshes",
+                "message": (
+                    "The mesh contains UE collision meshes without UVs "
+                    f"({', '.join(collision[:5])}); Painter rejects the scene and stays busy "
+                    "forever. Export the FBX for Painter without UCX_/UBX_/USP_/UCP_ objects."
+                ),
             })
         return {
             "ready": not errors,
@@ -1737,6 +1870,12 @@ result = {"requested": requested, "job": dict(state)}
         mesh_settings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         mesh = self._validate_mesh_path(mesh_file_path)
+        collision = _collision_mesh_names(mesh)
+        if collision:
+            raise ValueError(
+                f"Mesh contains UE collision meshes without UVs ({', '.join(collision[:5])}); "
+                "Painter rejects the scene. Export the FBX for Painter without UCX_/UBX_/USP_/UCP_ objects."
+            )
         normalized_unwrap = self._normalize_auto_unwrap_settings(auto_unwrap_settings)
         normalized_mesh = self._normalize_mesh_settings(mesh_settings, allow_gltf=False)
         backup = None
@@ -2020,7 +2159,7 @@ result = {
 
     def snapshot_layer_tree(self, texture_set: str | None = None) -> dict[str, Any]:
         """Return a detailed, deterministic snapshot suitable for before/after comparisons."""
-        code = '''
+        code = _GEOMETRY_HELPER + '''
 import substance_painter.layerstack as layerstack
 import substance_painter.textureset as textureset
 
@@ -2036,22 +2175,7 @@ def effect_info(effect):
     }
 
 def describe(node):
-    geometry = node.get_geometry_mask()
-    geometry_type = type(geometry).__name__
-    if isinstance(geometry, layerstack.GeometryMaskMeshParams):
-        geometry_mask = {
-            "type": "Mesh",
-            "inclusion_list": geometry.inclusion_list,
-            "elements": list(geometry.meshes),
-        }
-    elif isinstance(geometry, layerstack.GeometryMaskUVTilesParams):
-        geometry_mask = {
-            "type": "UVTile",
-            "inclusion_list": geometry.inclusion_list,
-            "elements": [1001 + tile.u + 10 * tile.v for tile in geometry.uv_tiles],
-        }
-    else:
-        geometry_mask = {"type": geometry_type, "inclusion_list": None, "elements": []}
+    geometry_mask = read_geometry_mask(node)
     item = {
         "uid": node.uid(),
         "name": node.get_name(),
@@ -2091,29 +2215,20 @@ result = {
         }
 
     def get_geometry_mask(self, uid: int) -> dict[str, Any]:
-        code = '''
+        code = _GEOMETRY_HELPER + '''
 import substance_painter.layerstack as layerstack
 
 node = layerstack.get_node_by_uid(params["uid"])
 if not isinstance(node, layerstack.LayerNode):
     raise TypeError(f"Node {params['uid']} does not support a geometry mask")
 texture_set = node.get_texture_set()
-current = node.get_geometry_mask()
-if isinstance(current, layerstack.GeometryMaskMeshParams):
-    mask_type = "Mesh"
-    elements = list(current.meshes)
-elif isinstance(current, layerstack.GeometryMaskUVTilesParams):
-    mask_type = "UVTile"
-    elements = [1001 + tile.u + 10 * tile.v for tile in current.uv_tiles]
-else:
-    mask_type = type(current).__name__
-    elements = []
+current = read_geometry_mask(node)
 result = {
     "uid": node.uid(),
     "name": node.get_name(),
-    "type": mask_type,
-    "inclusion_list": current.inclusion_list,
-    "elements": elements,
+    "type": current["type"],
+    "inclusion_list": current["inclusion_list"],
+    "elements": current["elements"],
     "available_meshes": list(texture_set.all_mesh_names()),
     "available_uv_tiles": [1001 + tile.u + 10 * tile.v for tile in texture_set.all_uv_tiles()],
 }
@@ -2139,7 +2254,7 @@ result = {
             for value in elements
         ):
             raise ValueError("UVTile geometry mask elements must be UDIM integers >= 1001")
-        code = '''
+        code = _GEOMETRY_HELPER + '''
 import substance_painter.layerstack as layerstack
 
 node = layerstack.get_node_by_uid(params["uid"])
@@ -2147,32 +2262,23 @@ if not isinstance(node, layerstack.LayerNode):
     raise TypeError(f"Node {params['uid']} does not support a geometry mask")
 texture_set = node.get_texture_set()
 if params["mask_type"] == "mesh":
-    available = set(texture_set.all_mesh_names())
+    available = {name: name for name in texture_set.all_mesh_names()}
     missing = [name for name in params["elements"] if name not in available]
     if missing:
         raise ValueError(f"Unknown mesh names: {missing}")
-    settings = layerstack.GeometryMaskMeshParams(
-        inclusion_list=params["inclusion_list"], meshes=params["elements"]
-    )
 else:
-    available = {1001 + tile.u + 10 * tile.v: tile for tile in texture_set.all_uv_tiles()}
-    missing = [udim for udim in params["elements"] if udim not in available]
+    available = {udim(tile): tile for tile in texture_set.all_uv_tiles()}
+    missing = [item for item in params["elements"] if item not in available]
     if missing:
         raise ValueError(f"Unknown UV tiles: {missing}")
-    settings = layerstack.GeometryMaskUVTilesParams(
-        inclusion_list=params["inclusion_list"],
-        uv_tiles=[available[udim] for udim in params["elements"]],
-    )
-node.set_geometry_mask(settings)
-current = node.get_geometry_mask()
+write_geometry_mask(node, params["mask_type"], params["inclusion_list"], params["elements"], available)
+current = read_geometry_mask(node)
 result = {
     "uid": node.uid(),
     "name": node.get_name(),
-    "type": "Mesh" if isinstance(current, layerstack.GeometryMaskMeshParams) else "UVTile",
-    "inclusion_list": current.inclusion_list,
-    "elements": (list(current.meshes)
-                 if isinstance(current, layerstack.GeometryMaskMeshParams)
-                 else [1001 + tile.u + 10 * tile.v for tile in current.uv_tiles]),
+    "type": current["type"],
+    "inclusion_list": current["inclusion_list"],
+    "elements": current["elements"],
 }
 '''
         return _unwrap(
@@ -2234,7 +2340,8 @@ result = {
             raise ValueError("channels must contain at least one channel")
         if len(set(channels)) != len(channels):
             raise ValueError("channels must not contain duplicates")
-        code = '''
+        code = _CHANNEL_HELPER + '''
+
 import substance_painter.layerstack as layerstack
 import substance_painter.textureset as textureset
 
@@ -2253,7 +2360,7 @@ for requested in params["channels"]:
     if not name or name not in textureset.ChannelType.__members__:
         raise ValueError(f"Unknown channel: {requested}")
     resolved.append(textureset.ChannelType.__members__[name])
-node.active_channels = set(resolved)
+set_channels_keeping_sources(node, set(resolved))
 result = {
     "uid": node.uid(),
     "name": node.get_name(),
@@ -2365,7 +2472,8 @@ result = {
             backup = self.save_project_copy(
                 backup_path, mode=backup_mode, overwrite=overwrite_backup
             )
-        code = '''
+        code = _CHANNEL_HELPER + '''
+
 import substance_painter.colormanagement as colormanagement
 import substance_painter.layerstack as layerstack
 import substance_painter.textureset as textureset
@@ -2403,14 +2511,14 @@ def create_items(items, parent=None):
         node.set_name(spec["name"])
         if "visible" in spec:
             node.set_visible(spec["visible"])
-        if isinstance(node, (layerstack.FillLayerNode, layerstack.PaintLayerNode)) and spec.get("active_channels"):
-            node.active_channels = {resolve_channel(name) for name in spec["active_channels"]}
+        if hasattr(type(node), "active_channels") and spec.get("active_channels"):
+            set_channels_keeping_sources(node, {resolve_channel(name) for name in spec["active_channels"]})
         if isinstance(node, layerstack.FillLayerNode):
             values = dict(spec.get("channels") or {})
             if spec.get("base_color") is not None:
                 values["BaseColor"] = spec["base_color"]
             if values:
-                node.active_channels = set(node.active_channels) | {resolve_channel(name) for name in values}
+                set_channels_keeping_sources(node, set(node.active_channels) | {resolve_channel(name) for name in values})
                 for name, color in values.items():
                     node.set_source(resolve_channel(name), colormanagement.Color(*color))
         mask = spec.get("mask")
@@ -2469,7 +2577,10 @@ result = {"created_count": len(created_nodes), "nodes": nodes, "rolled_back": Fa
         name: str | None = None,
     ) -> dict[str, Any]:
         normalized = effect_type.casefold()
-        allowed = {"fill", "paint", "generator", "filter", "levels", "anchor", "smart_mask"}
+        allowed = {
+            "fill", "paint", "generator", "filter", "levels", "anchor", "smart_mask",
+            "color_selection", "compare_mask",
+        }
         if normalized not in allowed:
             raise ValueError(f"effect_type must be one of: {', '.join(sorted(allowed))}")
         if normalized in {"fill", "generator", "filter", "smart_mask"} and resource_url is not None:
@@ -2505,6 +2616,10 @@ try:
         inserted = [layerstack.insert_filter_effect(position, resource_id)]
     elif kind == "levels":
         inserted = [layerstack.insert_levels_effect(position)]
+    elif kind == "color_selection":
+        inserted = [layerstack.insert_color_selection_effect(position)]
+    elif kind == "compare_mask":
+        inserted = [layerstack.insert_compare_mask_effect(position)]
     elif kind == "anchor":
         inserted = [layerstack.insert_anchor_point_effect(position, params.get("name") or "MCP Anchor")]
     elif kind == "smart_mask":
@@ -2543,6 +2658,258 @@ result = {
                 },
             )
         )
+
+    _EFFECT_PARAMS_PRELUDE = '''
+import substance_painter.colormanagement as colormanagement
+import substance_painter.layerstack as layerstack
+import substance_painter.resource as resource
+import substance_painter.textureset as textureset
+
+PARAM_NODES = (
+    layerstack.LevelsEffectNode,
+    layerstack.CompareMaskEffectNode,
+    layerstack.ColorSelectionEffectNode,
+)
+
+def is_enum(value):
+    return hasattr(type(value), "__members__") and hasattr(value, "name")
+
+def to_json(value):
+    if is_enum(value):
+        return value.name
+    if hasattr(value, "value_raw"):
+        return list(value.value_raw)
+    if isinstance(value, resource.ResourceID):
+        return value.url()
+    if isinstance(value, (list, tuple)):
+        return [to_json(item) for item in value]
+    return value
+
+def to_color(value, field):
+    if (not isinstance(value, list) or len(value) not in (3, 4)
+            or any(not isinstance(c, (int, float)) or isinstance(c, bool) for c in value)):
+        raise ValueError(f"{field} expects RGB arrays")
+    # ID-map colours are picked from an sRGB bake, so match them in sRGB.
+    return colormanagement.Color(*value[:3], colormanagement.GenericColorSpace.sRGB)
+
+def convert(field, current, value):
+    if field == "id_mask":
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str) or not value.startswith("resource://"):
+            raise ValueError("id_mask must be a resource:// URL or null")
+        return resource.ResourceID.from_url(value)
+    if field == "colors":
+        if not isinstance(value, list):
+            raise ValueError("colors must be a list of RGB arrays")
+        return [to_color(item, field) for item in value]
+    if is_enum(current):
+        members = type(current).__members__
+        if value not in members:
+            raise ValueError(f"{field} must be one of {sorted(members)}")
+        return members[value]
+    if isinstance(current, tuple):
+        if not isinstance(value, list) or len(value) != len(current):
+            raise ValueError(f"{field} must contain {len(current)} values (this Levels is RGB)")
+        return tuple(float(item) for item in value)
+    if isinstance(current, bool):
+        if not isinstance(value, bool):
+            raise ValueError(f"{field} must be a boolean")
+        return value
+    if isinstance(current, (int, float)):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"{field} must be a number (this Levels is mono)" if isinstance(value, list)
+                             else f"{field} must be a number")
+        return float(value)
+    return value
+
+def describe(node):
+    current = node.get_parameters()
+    data = {
+        "uid": node.uid(),
+        "name": node.get_name(),
+        "node_type": type(node).__name__,
+        "parameters_type": type(current).__name__,
+        "parameters": {f: to_json(getattr(current, f)) for f in current.__dataclass_fields__},
+    }
+    if isinstance(node, layerstack.LevelsEffectNode):
+        try:
+            data["affected_channel"] = node.affected_channel.name
+        except Exception:
+            data["affected_channel"] = None
+    return data
+
+node = layerstack.get_node_by_uid(params["uid"])
+if not isinstance(node, PARAM_NODES):
+    raise TypeError(
+        f"Node {params['uid']} ({type(node).__name__}) has no effect parameters; "
+        "use get_fill_parameters for Fill/Generator/Filter sources"
+    )
+'''
+
+    def get_effect_parameters(self, uid: int) -> dict[str, Any]:
+        code = self._EFFECT_PARAMS_PRELUDE + '''
+result = describe(node)
+'''
+        return _unwrap(self.remote.execute_python_json(code, {"uid": uid}))
+
+    def set_effect_parameters(
+        self,
+        uid: int,
+        values: dict[str, Any] | None = None,
+        affected_channel: str | None = None,
+    ) -> dict[str, Any]:
+        if not values and affected_channel is None:
+            raise ValueError("Provide values and/or affected_channel")
+        code = self._EFFECT_PARAMS_PRELUDE + '''
+import dataclasses
+
+if params.get("affected_channel") is not None:
+    if not isinstance(node, layerstack.LevelsEffectNode):
+        raise ValueError("affected_channel only applies to Levels effects")
+    if params["affected_channel"] not in textureset.ChannelType.__members__:
+        raise ValueError(f"Unknown channel: {params['affected_channel']}")
+    node.affected_channel = textureset.ChannelType.__members__[params["affected_channel"]]
+if params.get("values"):
+    current = node.get_parameters()
+    fields = current.__dataclass_fields__
+    unknown = sorted(set(params["values"]) - set(fields))
+    if unknown:
+        raise ValueError(f"Unknown {type(current).__name__} fields: {unknown}; valid: {sorted(fields)}")
+    changes = {f: convert(f, getattr(current, f), v) for f, v in params["values"].items()}
+    node.set_parameters(dataclasses.replace(current, **changes))
+result = describe(node)
+'''
+        return _unwrap(
+            self.remote.execute_python_json(
+                code, {"uid": uid, "values": values or {}, "affected_channel": affected_channel}
+            )
+        )
+
+    def run_python(self, code: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Run user code with Painter modules preloaded; capture stdout and tracebacks."""
+        if not code.strip():
+            raise ValueError("code must not be empty")
+        runner = '''
+import contextlib
+import io
+import traceback
+import substance_painter
+
+namespace = {"params": params["params"], "result": None, "substance_painter": substance_painter}
+for module in ("application", "baking", "colormanagement", "display", "export", "layerstack",
+               "levels", "project", "properties", "resource", "source", "textureset", "ui"):
+    try:
+        namespace[module] = __import__("substance_painter." + module, fromlist=[module])
+    except Exception:
+        pass
+output = io.StringIO()
+try:
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        exec(compile(params["code"], "<execute_python>", "exec"), namespace, namespace)
+    result = {"ok": True, "result": namespace.get("result"), "stdout": output.getvalue()}
+except BaseException:
+    result = {"ok": False, "error": traceback.format_exc(), "stdout": output.getvalue()}
+'''
+        return _unwrap(
+            self.remote.execute_python_json(runner, {"code": code, "params": params or {}})
+        )
+
+    _PREVIEW_MAPS = {
+        "BaseColor": ("basecolor", "RGB"),
+        "Roughness": ("roughness", "L"),
+        "Metallic": ("metallic", "L"),
+        "Normal": ("normal", "RGB"),
+        "Height": ("height", "L"),
+        "Emissive": ("emissive", "RGB"),
+        "Opacity": ("opacity", "L"),
+        "AO": ("ambientOcclusion", "L"),
+    }
+
+    def preview_textures(
+        self,
+        texture_set: str | None = None,
+        channels: list[str] | None = None,
+        size: int = 512,
+    ) -> dict[str, Any]:
+        """Export low-res channel PNGs into a private cache dir and return their paths."""
+        channels = channels or ["BaseColor"]
+        unknown = [c for c in channels if c not in self._PREVIEW_MAPS]
+        if unknown:
+            raise ValueError(f"Unknown preview channels {unknown}; use {sorted(self._PREVIEW_MAPS)}")
+        if size not in (128, 256, 512, 1024, 2048):
+            raise ValueError("size must be one of 128, 256, 512, 1024, 2048")
+        # Home is shared with the Steam runtime container Painter runs in; /tmp may not be.
+        cache = Path.home() / ".cache" / "substance-painter-mcp" / "preview"
+        cache.mkdir(parents=True, exist_ok=True)
+        for old in cache.glob("*.png"):
+            old.unlink()
+        maps = []
+        for channel in channels:
+            src, mode = self._PREVIEW_MAPS[channel]
+            dest = ["R", "G", "B"] if mode == "RGB" else ["L"]
+            maps.append({
+                "fileName": "$textureSet_" + channel,
+                "channels": [
+                    {"destChannel": d, "srcChannel": d if mode == "RGB" else "L",
+                     "srcMapType": "documentMap", "srcMapName": src}
+                    for d in dest
+                ],
+                "parameters": {"fileFormat": "png", "bitDepth": "8", "dithering": False},
+            })
+        code = '''
+import substance_painter.export as export
+import substance_painter.textureset as textureset
+
+if params["texture_set"]:
+    names = [params["texture_set"]]
+else:
+    names = [textureset.get_active_stack().material().name()]
+config = {
+    "exportShaderParams": False,
+    "exportPath": params["path"],
+    "defaultExportPreset": "mcp_preview",
+    "exportPresets": [{"name": "mcp_preview", "maps": params["maps"]}],
+    "exportList": [{"rootPath": name} for name in names],
+    "exportParameters": [{"parameters": {"sizeLog2": params["size_log2"], "paddingAlgorithm": "infinite"}}],
+}
+exported = export.export_project_textures(config)
+files = [path for paths in exported.textures.values() for path in paths]
+result = {"status": exported.status.name, "message": exported.message, "files": files, "texture_sets": names}
+'''
+        result = _unwrap(
+            self.remote.execute_python_json(
+                code,
+                {
+                    "texture_set": texture_set,
+                    "path": str(cache),
+                    "maps": maps,
+                    "size_log2": size.bit_length() - 1,
+                },
+            )
+        )
+        result["files"] = [f for f in result["files"] if Path(f).is_file()]
+        return result
+
+    def capture_ui(self, max_width: int = 1600) -> dict[str, Any]:
+        """Render Painter's main window (panels, layer stack, status bar) to PNG (base64)."""
+        code = '''
+import base64
+from PySide6 import QtCore
+import substance_painter.ui as ui
+
+# QWidget.grab() renders the Qt widgets; the Vulkan 3D/2D viewports come out black, and
+# screen grabs under XWayland are black entirely.
+pixmap = ui.get_main_window().grab()
+if params["max_width"] and pixmap.width() > params["max_width"]:
+    pixmap = pixmap.scaledToWidth(params["max_width"], QtCore.Qt.SmoothTransformation)
+buffer = QtCore.QBuffer()
+buffer.open(QtCore.QIODevice.WriteOnly)
+pixmap.save(buffer, "PNG")
+result = {"width": pixmap.width(), "height": pixmap.height(),
+          "png_base64": base64.b64encode(bytes(buffer.data())).decode("ascii")}
+'''
+        return _unwrap(self.remote.execute_python_json(code, {"max_width": max_width}))
 
     def create_fill_layer(
         self,
@@ -3167,7 +3534,8 @@ result = {
             raise ValueError("resource_url must start with resource://")
         if material_mode and channel is not None:
             raise ValueError("channel must be omitted when material_mode=true")
-        code = '''
+        code = _CHANNEL_HELPER + '''
+
 import substance_painter.layerstack as layerstack
 import substance_painter.resource as resource
 import substance_painter.textureset as textureset
@@ -3210,7 +3578,7 @@ else:
             source = node.set_material_source(resource_id)
             resolved_channel = None
         else:
-            node.active_channels = original_channels | {resolved}
+            set_channels_keeping_sources(node, original_channels | {resolved})
             source = node.set_source(resolved, resource_id)
             resolved_channel = resolved.name
     except Exception:
@@ -3220,7 +3588,7 @@ else:
                     node.set_source(resolved, original_source)
                 except Exception:
                     pass
-            node.active_channels = original_channels
+            set_channels_keeping_sources(node, original_channels)
         raise
     verified_id = getattr(source, "resource_id", None)
     result = {
@@ -3265,10 +3633,21 @@ def json_value(value):
     return {"type": type(value).__name__, "value": str(value)}
 
 def resolve_source(node, requested):
+    if isinstance(node, (layerstack.GeneratorEffectNode, layerstack.FilterEffectNode)):
+        if requested is not None:
+            raise ValueError("channel must be omitted for Generator/Filter effects")
+        source = node.get_source()
+        if source is None:
+            raise ValueError("Generator/Filter effect has no procedural source")
+        return source, None
     if node.source_mode.name == "Material":
         if requested is not None:
             raise ValueError("channel must be omitted for a material-mode Fill")
         return node.get_material_source(), None
+    if node.source_mode.name != "Split":
+        if requested is not None:
+            raise ValueError("This Fill is mono-channel (e.g. a mask fill); omit channel")
+        return node.get_source(None), None
     if not requested:
         raise ValueError("channel is required for a split-mode Fill")
     aliases = {"Roughness": "SpecularRoughness", "Metallic": "BaseMetalness", "Emission": "Emissive"}
@@ -3281,8 +3660,14 @@ def resolve_source(node, requested):
     return node.get_source(resolved), resolved.name
 
 node = layerstack.get_node_by_uid(params["uid"])
-if not isinstance(node, layerstack.FillLayerNode):
-    raise TypeError(f"Node {params['uid']} is not a FillLayerNode")
+supported = (
+    layerstack.FillLayerNode,
+    layerstack.FillEffectNode,
+    layerstack.GeneratorEffectNode,
+    layerstack.FilterEffectNode,
+)
+if not isinstance(node, supported):
+    raise TypeError(f"Node {params['uid']} is not a Fill layer or Fill/Generator/Filter effect")
 source, channel_name = resolve_source(node, params.get("channel"))
 if not hasattr(source, "get_parameters") or not hasattr(source, "get_properties"):
     raise TypeError(f"Fill source {type(source).__name__} has no procedural parameters")
@@ -3304,7 +3689,8 @@ for name, prop in properties.items():
 result = {
     "uid": node.uid(),
     "name": node.get_name(),
-    "source_mode": node.source_mode.name,
+    "source_mode": getattr(getattr(node, "source_mode", None), "name", None),
+    "node_type": type(node).__name__,
     "channel": channel_name,
     "source_type": type(source).__name__,
     "presets": source.get_preset_list() if hasattr(source, "get_preset_list") else [],
@@ -3337,10 +3723,21 @@ def json_value(value):
     return {"type": type(value).__name__, "value": str(value)}
 
 def resolve_source(node, requested):
+    if isinstance(node, (layerstack.GeneratorEffectNode, layerstack.FilterEffectNode)):
+        if requested is not None:
+            raise ValueError("channel must be omitted for Generator/Filter effects")
+        source = node.get_source()
+        if source is None:
+            raise ValueError("Generator/Filter effect has no procedural source")
+        return source, None
     if node.source_mode.name == "Material":
         if requested is not None:
             raise ValueError("channel must be omitted for a material-mode Fill")
         return node.get_material_source(), None
+    if node.source_mode.name != "Split":
+        if requested is not None:
+            raise ValueError("This Fill is mono-channel (e.g. a mask fill); omit channel")
+        return node.get_source(None), None
     if not requested:
         raise ValueError("channel is required for a split-mode Fill")
     aliases = {"Roughness": "SpecularRoughness", "Metallic": "BaseMetalness", "Emission": "Emissive"}
@@ -3402,8 +3799,14 @@ def convert(prop, value):
     return value
 
 node = layerstack.get_node_by_uid(params["uid"])
-if not isinstance(node, layerstack.FillLayerNode):
-    raise TypeError(f"Node {params['uid']} is not a FillLayerNode")
+supported = (
+    layerstack.FillLayerNode,
+    layerstack.FillEffectNode,
+    layerstack.GeneratorEffectNode,
+    layerstack.FilterEffectNode,
+)
+if not isinstance(node, supported):
+    raise TypeError(f"Node {params['uid']} is not a Fill layer or Fill/Generator/Filter effect")
 source, channel_name = resolve_source(node, params.get("channel"))
 if not hasattr(source, "get_parameters") or not hasattr(source, "get_properties"):
     raise TypeError(f"Fill source {type(source).__name__} has no procedural parameters")
@@ -3425,7 +3828,8 @@ verified = source.get_parameters()
 result = {
     "uid": node.uid(),
     "name": node.get_name(),
-    "source_mode": node.source_mode.name,
+    "source_mode": getattr(getattr(node, "source_mode", None), "name", None),
+    "node_type": type(node).__name__,
     "channel": channel_name,
     "updated": {name: json_value(verified[name]) for name in converted},
 }
@@ -3446,10 +3850,21 @@ import substance_painter.layerstack as layerstack
 import substance_painter.textureset as textureset
 
 def resolve_source(node, requested):
+    if isinstance(node, (layerstack.GeneratorEffectNode, layerstack.FilterEffectNode)):
+        if requested is not None:
+            raise ValueError("channel must be omitted for Generator/Filter effects")
+        source = node.get_source()
+        if source is None:
+            raise ValueError("Generator/Filter effect has no procedural source")
+        return source, None
     if node.source_mode.name == "Material":
         if requested is not None:
             raise ValueError("channel must be omitted for a material-mode Fill")
         return node.get_material_source(), None
+    if node.source_mode.name != "Split":
+        if requested is not None:
+            raise ValueError("This Fill is mono-channel (e.g. a mask fill); omit channel")
+        return node.get_source(None), None
     if not requested:
         raise ValueError("channel is required for a split-mode Fill")
     aliases = {"Roughness": "SpecularRoughness", "Metallic": "BaseMetalness", "Emission": "Emissive"}
@@ -3462,8 +3877,14 @@ def resolve_source(node, requested):
     return node.get_source(resolved), resolved.name
 
 node = layerstack.get_node_by_uid(params["uid"])
-if not isinstance(node, layerstack.FillLayerNode):
-    raise TypeError(f"Node {params['uid']} is not a FillLayerNode")
+supported = (
+    layerstack.FillLayerNode,
+    layerstack.FillEffectNode,
+    layerstack.GeneratorEffectNode,
+    layerstack.FilterEffectNode,
+)
+if not isinstance(node, supported):
+    raise TypeError(f"Node {params['uid']} is not a Fill layer or Fill/Generator/Filter effect")
 source, channel_name = resolve_source(node, params.get("channel"))
 if not hasattr(source, "get_preset_list") or not hasattr(source, "apply_preset"):
     raise TypeError(f"Fill source {type(source).__name__} has no procedural presets")
@@ -3545,7 +3966,8 @@ result = {"count": len(anchors), "anchors": anchors}
             raise ValueError("channel must be omitted when material_mode=true")
         if not material_mode and not channel:
             raise ValueError("channel is required when material_mode=false")
-        code = '''
+        code = _CHANNEL_HELPER + '''
+
 import substance_painter.layerstack as layerstack
 import substance_painter.textureset as textureset
 
@@ -3570,7 +3992,7 @@ else:
     original_channels = set(node.active_channels)
     original_source = node.get_source(resolved) if resolved in original_channels else None
     try:
-        node.active_channels = original_channels | {resolved}
+        set_channels_keeping_sources(node, original_channels | {resolved})
         source = node.set_source(resolved, anchor)
     except Exception:
         if original_source is not None:
@@ -3578,7 +4000,7 @@ else:
                 node.set_source(resolved, original_source)
             except Exception:
                 pass
-        node.active_channels = original_channels
+        set_channels_keeping_sources(node, original_channels)
         raise
     resolved_channel = resolved.name
 result = {
@@ -3640,7 +4062,8 @@ result = {
             color = [float(value)] * 3 if isinstance(value, (int, float)) else list(value)
             self._validate_color(color)
             normalized[channel] = color
-        code = '''
+        code = _CHANNEL_HELPER + '''
+
 import substance_painter.colormanagement as colormanagement
 import substance_painter.layerstack as layerstack
 import substance_painter.textureset as textureset
@@ -3653,7 +4076,7 @@ for name, color in params["values"].items():
     if name not in textureset.ChannelType.__members__:
         raise ValueError(f"Unknown channel: {name}")
     resolved[textureset.ChannelType.__members__[name]] = color
-node.active_channels = set(node.active_channels) | set(resolved)
+set_channels_keeping_sources(node, set(node.active_channels) | set(resolved))
 verified = {}
 for channel, color in resolved.items():
     source = node.set_source(channel, colormanagement.Color(*color))
@@ -3734,10 +4157,19 @@ import substance_painter.layerstack as layerstack
 import substance_painter.textureset as textureset
 
 node = layerstack.get_node_by_uid(params["uid"])
-channel_name = params.get("channel") or "BaseColor"
-if channel_name not in textureset.ChannelType.__members__:
-    raise ValueError(f"Unknown channel: {channel_name}")
-channel = textureset.ChannelType.__members__[channel_name]
+# Mask-stack nodes are mono-channel: Painter rejects any channel for their blend mode and opacity.
+if node.is_in_mask_stack():
+    if params.get("channel"):
+        raise ValueError("This node is in a mask stack; omit channel")
+    channel_name = None
+    channel = None
+else:
+    channel_name = params.get("channel") or "BaseColor"
+    if channel_name not in textureset.ChannelType.__members__:
+        raise ValueError(f"Unknown channel: {channel_name}")
+    channel = textureset.ChannelType.__members__[channel_name]
+if (params.get("opacity") is not None or params.get("blending_mode")) and not node.has_blending():
+    raise ValueError(f"{type(node).__name__} has no blending (opacity/blend mode)")
 if params.get("visible") is not None:
     node.set_visible(params["visible"])
 if params.get("opacity") is not None:
@@ -3750,9 +4182,10 @@ result = {
     "uid": node.uid(),
     "name": node.get_name(),
     "visible": node.is_visible(),
-    "opacity": node.get_opacity(channel),
-    "blending_mode": node.get_blending_mode(channel).name,
+    "opacity": node.get_opacity(channel) if node.has_blending() else None,
+    "blending_mode": node.get_blending_mode(channel).name if node.has_blending() else None,
     "channel": channel_name,
+    "in_mask_stack": node.is_in_mask_stack(),
 }
 '''
         return _unwrap(

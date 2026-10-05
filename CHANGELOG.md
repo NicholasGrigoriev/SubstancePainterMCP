@@ -2,6 +2,41 @@
 
 All notable changes to this project are documented in this file.
 
+## 1.1.0 - 2026-10-05
+
+Fork release ([NicholasGrigoriev/SubstancePainterMCP](https://github.com/NicholasGrigoriev/SubstancePainterMCP)). Expands the server from 79 to 84 tools, driven by an agent texturing a game kit end to end, and adds compatibility with Painter 11.1.3 (Steam edition, Linux).
+
+### Fewer round trips
+
+- Added `run_batch`: runs a list of `{"tool", "args"}` steps in one request. String arguments of the form `$N.key.key` or `$prev.key` are replaced by earlier results, so a create → configure → mask chain is a single call. It can stop on the first error (the default) or continue.
+- `execute_python` (still opt-in via `SP_MCP_ALLOW_EXECUTE_PYTHON=1`) now preloads the `substance_painter` modules by short name and accepts a `params` object. It returns `result` and the captured stdout, and reports exceptions as `ok: false` with the full traceback.
+
+### Seeing the result
+
+- Added `preview_textures`: exports chosen channels (BaseColor, Roughness, Metallic, Normal, Height, Emissive, Opacity, AO) at 128–2048 px to a private cache and returns them as inline images.
+- Added `capture_ui`: renders the Painter main window (layer stack, properties, status bar). The Vulkan viewports cannot be grabbed from inside Painter on Linux; their area comes back black or as garbage.
+
+### Masks and procedurals
+
+- `get_fill_parameters`, `set_fill_parameters` and `apply_fill_preset` now accept Generator and Filter effects and mono-channel mask Fills, so generator settings such as dirt level and edge wear can be edited.
+- Added `get_effect_parameters` and `set_effect_parameters` for Levels (mono or RGB, plus the affected channel), Color Selection (ID-map colours, tolerance, hardness, background) and Compare Mask.
+- `insert_mask_effect` now also inserts `color_selection` and `compare_mask` effects.
+- `set_layer_properties` now sets blend mode and opacity on mask-stack effects, which are channel-less. Two mask effects can now be combined with Multiply, Subtract and so on.
+- Mask Fills take a resource via `set_fill_resource` or `insert_mask_effect(..., resource_url=)`. These are mono-channel, so no channel is passed.
+
+### Fixes
+
+- **Split Fill channels lost their sources.** Painter resets every channel's source whenever `active_channels` is assigned, even to an identical set. Every channel-adding path (`set_fill_resource`, `set_fill_channels`, `set_active_channels`, recipes) now skips no-op assignments and restores the surviving channels' sources, procedural parameters and image inputs.
+- **Painter 11.1 geometry masks.** That API has no `get_geometry_mask()`/params objects, which broke `snapshot_layer_tree`, `plan_layer_recipe`, `create_layer_recipe` and the geometry-mask tools. A compatibility layer now uses the mask type and enabled-mesh/UV-tile lists when the newer API is absent.
+- Recipes skip `active_channels` on Paint layers when Painter does not expose it, instead of silently setting a Python attribute.
+- Project creation and mesh reload refuse meshes containing Unreal collision proxies (`UCX_`/`UBX_`/`USP_`/`UCP_`). They have no UVs, so Painter rejects the scene and stays busy forever.
+- Project creation and mesh reload only pass `auto_unwrap_settings` where the Painter API accepts it.
+
+### Validation
+
+- Expanded the automated suite from 66 to 75 tests.
+- Live-tested every change above in Painter 11.1.3 on a disposable project.
+
 ## 1.0.0 - 2026-07-28
 
 Version 1.0.0 expands the server from 75 to 79 tools and completes the public Painter resource-ingestion workflow with persistent shelf support and observable indexing.

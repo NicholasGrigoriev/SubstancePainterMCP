@@ -819,3 +819,43 @@ def test_export_rejects_path_outside_root(monkeypatch, tmp_path):
     monkeypatch.setenv("SP_MCP_EXPORT_ROOTS", str(allowed))
     with pytest.raises(PermissionError, match="outside"):
         PainterOperations(FakeRemote()).plan_texture_export(str(tmp_path / "elsewhere"), "preset")
+
+
+def test_run_python_ships_code_and_params_as_data():
+    remote = FakeRemote({"success": True, "data": {"ok": True, "result": 3, "stdout": ""}})
+    result = PainterOperations(remote).run_python("result = params['a'] + 1", {"a": 2})
+    assert result["result"] == 3
+    code, params = remote.calls[0]
+    assert params == {"code": "result = params['a'] + 1", "params": {"a": 2}}
+    assert "redirect_stdout" in code and "traceback.format_exc" in code
+
+
+def test_set_effect_parameters_requires_something_to_change():
+    with pytest.raises(ValueError):
+        PainterOperations(FakeRemote()).set_effect_parameters(5)
+
+
+def test_preview_textures_validates_channels_and_size():
+    ops = PainterOperations(FakeRemote())
+    with pytest.raises(ValueError):
+        ops.preview_textures(channels=["Glossiness"])
+    with pytest.raises(ValueError):
+        ops.preview_textures(size=500)
+
+
+def test_mask_stack_nodes_drop_channel_for_blending():
+    remote = FakeRemote()
+    PainterOperations(remote).set_layer_properties(3, blending_mode="Multiply")
+    code, _ = remote.calls[0]
+    assert "is_in_mask_stack()" in code
+
+
+def test_collision_meshes_are_detected_in_fbx(tmp_path):
+    from substance_painter_mcp.operations import _collision_mesh_names
+
+    mesh = tmp_path / "crate.fbx"
+    mesh.write_bytes(b"Kaydara FBX Binary\x00Model::SM_Crate\x00Model::UCX_SM_Crate_01\x00UBX_Box\x00")
+    assert _collision_mesh_names(mesh) == ["UBX_Box", "UCX_SM_Crate_01"]
+    clean = tmp_path / "clean.fbx"
+    clean.write_bytes(b"Kaydara FBX Binary\x00Model::SM_Crate\x00")
+    assert _collision_mesh_names(clean) == []
