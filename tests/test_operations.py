@@ -278,12 +278,30 @@ def test_fill_resource_requires_channel_or_material_mode():
     operations = PainterOperations(FakeRemote())
     with pytest.raises(ValueError, match="resource://"):
         operations.set_fill_resource(1, "https://example.com/a.png", "BaseColor")
-    with pytest.raises(ValueError, match="channel is required"):
-        operations.set_fill_resource(1, "resource://project/a")
     with pytest.raises(ValueError, match="must be omitted"):
         operations.set_fill_resource(
             1, "resource://project/a", "BaseColor", material_mode=True
         )
+
+
+def test_fill_resource_without_channel_defers_to_painter_for_mask_fills():
+    # Mask fills are mono-channel, so "no channel" is only wrong for split-mode layers; Painter decides.
+    remote = FakeRemote()
+    PainterOperations(remote).set_fill_resource(1, "resource://project/a")
+    code, params = remote.calls[0]
+    assert params["channel"] is None and params["material_mode"] is False
+    assert "FillEffectNode" in code and "set_source(None, resource_id)" in code
+    assert "channel is required" in code
+
+
+def test_mask_fill_effect_applies_resource_url():
+    remote = FakeRemote()
+    PainterOperations(remote).insert_mask_effect(1, "fill", "resource://project/mask_rubber")
+    code, params = remote.calls[0]
+    assert params["resource_url"] == "resource://project/mask_rubber"
+    assert "inserted[0].set_source(None, resource_id)" in code
+    with pytest.raises(ValueError, match="resource://"):
+        PainterOperations(FakeRemote()).insert_mask_effect(1, "fill", "/tmp/mask.png")
 
 
 def test_procedural_input_requires_exactly_one_action():

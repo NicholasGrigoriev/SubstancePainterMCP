@@ -310,6 +310,14 @@ def auto_unwrap(config):
         create_fewer_seams=config["create_fewer_seams"],
     )
 
+def unwrap_kwargs(config):
+    # Painter 11.1.x Settings/MeshReloadingSettings have no auto_unwrap_settings field at all.
+    if config is None:
+        return {}
+    if "auto_unwrap_settings" not in getattr(project.Settings, "__dataclass_fields__", {}):
+        raise RuntimeError("auto_unwrap_settings is not supported by this Painter version")
+    return {"auto_unwrap_settings": auto_unwrap(config)}
+
 def mesh_settings(config):
     if config is None:
         return None
@@ -334,7 +342,7 @@ settings = project.Settings(
     import_cameras=config.get("import_cameras"),
     mesh_unit_scale=config.get("mesh_unit_scale"),
     mesh_settings=mesh_settings(config.get("mesh_settings")),
-    auto_unwrap_settings=auto_unwrap(config.get("auto_unwrap_settings")),
+    **unwrap_kwargs(config.get("auto_unwrap_settings")),
 )
 original_path = str(project.file_path()) if project.is_open() and project.file_path() else None
 job_id = uuid.uuid4().hex
@@ -1886,6 +1894,14 @@ def auto_unwrap(config):
         create_fewer_seams=config["create_fewer_seams"],
     )
 
+def unwrap_kwargs(config):
+    # Painter 11.1.x Settings/MeshReloadingSettings have no auto_unwrap_settings field at all.
+    if config is None:
+        return {}
+    if "auto_unwrap_settings" not in getattr(project.Settings, "__dataclass_fields__", {}):
+        raise RuntimeError("auto_unwrap_settings is not supported by this Painter version")
+    return {"auto_unwrap_settings": auto_unwrap(config)}
+
 def usd_settings(config):
     if config is None:
         return None
@@ -1900,7 +1916,7 @@ settings = project.MeshReloadingSettings(
     import_cameras=params["import_cameras"],
     preserve_strokes=params["preserve_strokes"],
     mesh_settings=usd_settings(params.get("mesh_settings")),
-    auto_unwrap_settings=auto_unwrap(params.get("auto_unwrap_settings")),
+    **unwrap_kwargs(params.get("auto_unwrap_settings")),
 )
 try:
     project.reload_mesh(params["mesh_file_path"], settings, on_loaded)
@@ -2456,7 +2472,7 @@ result = {"created_count": len(created_nodes), "nodes": nodes, "rolled_back": Fa
         allowed = {"fill", "paint", "generator", "filter", "levels", "anchor", "smart_mask"}
         if normalized not in allowed:
             raise ValueError(f"effect_type must be one of: {', '.join(sorted(allowed))}")
-        if normalized in {"generator", "filter", "smart_mask"} and resource_url is not None:
+        if normalized in {"fill", "generator", "filter", "smart_mask"} and resource_url is not None:
             if not resource_url.startswith("resource://"):
                 raise ValueError("resource_url must start with resource://")
         if normalized == "smart_mask" and not resource_url:
@@ -2479,6 +2495,8 @@ try:
     kind = params["effect_type"]
     if kind == "fill":
         inserted = [layerstack.insert_fill(position)]
+        if resource_id is not None:
+            inserted[0].set_source(None, resource_id)
     elif kind == "paint":
         inserted = [layerstack.insert_paint(position)]
     elif kind == "generator":
@@ -3149,55 +3167,70 @@ result = {
             raise ValueError("resource_url must start with resource://")
         if material_mode and channel is not None:
             raise ValueError("channel must be omitted when material_mode=true")
-        if not material_mode and not channel:
-            raise ValueError("channel is required when material_mode=false")
         code = '''
 import substance_painter.layerstack as layerstack
 import substance_painter.resource as resource
 import substance_painter.textureset as textureset
 
 node = layerstack.get_node_by_uid(params["uid"])
-if not isinstance(node, layerstack.FillLayerNode):
-    raise TypeError(f"Node {params['uid']} is not a FillLayerNode")
+if not isinstance(node, (layerstack.FillLayerNode, layerstack.FillEffectNode)):
+    raise TypeError(f"Node {params['uid']} is not a Fill layer or Fill effect")
 resource_id = resource.ResourceID.from_url(params["resource_url"])
-aliases = {"Roughness": "SpecularRoughness", "Metallic": "BaseMetalness", "Emission": "Emissive"}
-requested = params["channel"]
-channel_name = None if params["material_mode"] else (
-    requested if requested in textureset.ChannelType.__members__ else aliases.get(requested)
-)
-if not params["material_mode"] and (
-    not channel_name or channel_name not in textureset.ChannelType.__members__
-):
-    raise ValueError(f"Unknown channel: {requested}")
-resolved = textureset.ChannelType.__members__[channel_name] if channel_name else None
-original_channels = set(node.active_channels)
-original_source = node.get_source(resolved) if resolved in original_channels else None
-try:
-    if params["material_mode"]:
-        source = node.set_material_source(resource_id)
-        resolved_channel = None
-    else:
-        node.active_channels = original_channels | {resolved}
-        source = node.set_source(resolved, resource_id)
-        resolved_channel = resolved.name
-except Exception:
-    if resolved is not None:
-        if original_source is not None:
-            try:
-                node.set_source(resolved, original_source)
-            except Exception:
-                pass
-        node.active_channels = original_channels
-    raise
-verified_id = getattr(source, "resource_id", None)
-result = {
-    "uid": node.uid(),
-    "name": node.get_name(),
-    "source_mode": node.source_mode.name,
-    "channel": resolved_channel,
-    "source_type": type(source).__name__,
-    "resource_url": verified_id.url() if verified_id else params["resource_url"],
-}
+# A Fill inside a mask stack is mono-channel: Painter wants set_source(None, ...), never a channel.
+if node.source_mode.name not in ("Material", "Split"):
+    if params["channel"] or params["material_mode"]:
+        raise ValueError("This Fill is mono-channel (e.g. a mask fill); omit channel and material_mode")
+    source = node.set_source(None, resource_id)
+    verified_id = getattr(source, "resource_id", None)
+    result = {
+        "uid": node.uid(),
+        "name": node.get_name(),
+        "source_mode": node.source_mode.name,
+        "channel": None,
+        "source_type": type(source).__name__,
+        "resource_url": verified_id.url() if verified_id else params["resource_url"],
+    }
+else:
+    if not params["material_mode"] and not params["channel"]:
+        raise ValueError("channel is required when material_mode=false")
+    aliases = {"Roughness": "SpecularRoughness", "Metallic": "BaseMetalness", "Emission": "Emissive"}
+    requested = params["channel"]
+    channel_name = None if params["material_mode"] else (
+        requested if requested in textureset.ChannelType.__members__ else aliases.get(requested)
+    )
+    if not params["material_mode"] and (
+        not channel_name or channel_name not in textureset.ChannelType.__members__
+    ):
+        raise ValueError(f"Unknown channel: {requested}")
+    resolved = textureset.ChannelType.__members__[channel_name] if channel_name else None
+    original_channels = set(node.active_channels)
+    original_source = node.get_source(resolved) if resolved in original_channels else None
+    try:
+        if params["material_mode"]:
+            source = node.set_material_source(resource_id)
+            resolved_channel = None
+        else:
+            node.active_channels = original_channels | {resolved}
+            source = node.set_source(resolved, resource_id)
+            resolved_channel = resolved.name
+    except Exception:
+        if resolved is not None:
+            if original_source is not None:
+                try:
+                    node.set_source(resolved, original_source)
+                except Exception:
+                    pass
+            node.active_channels = original_channels
+        raise
+    verified_id = getattr(source, "resource_id", None)
+    result = {
+        "uid": node.uid(),
+        "name": node.get_name(),
+        "source_mode": node.source_mode.name,
+        "channel": resolved_channel,
+        "source_type": type(source).__name__,
+        "resource_url": verified_id.url() if verified_id else params["resource_url"],
+    }
 '''
         return _unwrap(
             self.remote.execute_python_json(
